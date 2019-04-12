@@ -7,6 +7,7 @@ import (
 	log "github.com/Sirupsen/logrus"
 	"github.com/cloudflare/goflow/decoders"
 	"github.com/cloudflare/goflow/decoders/netflow"
+	"github.com/cloudflare/goflow/decoders/netflowlegacy"
 	"github.com/cloudflare/goflow/decoders/sflow"
 	flowmessage "github.com/cloudflare/goflow/pb"
 	"github.com/cloudflare/goflow/producer"
@@ -31,16 +32,21 @@ import (
 const AppVersion = "GoFlow v2.0.7"
 
 var (
-	FEnable = flag.Bool("netflow", true, "Enable NetFlow")
+	FEnable = flag.Bool("netflow", true, "Enable NetFlowV9/IPFIX")
+	LEnable = flag.Bool("netflowv5", false, "Enable NetFlowV5")
 	SEnable = flag.Bool("sflow", true, "Enable sFlow")
 
-	FAddr = flag.String("faddr", ":", "NetFlow/IPFIX listening address")
-	FPort = flag.Int("fport", 2055, "NetFlow/IPFIX listening port")
+	FAddr = flag.String("faddr", ":", "NetFlowV9/IPFIX listening address")
+	FPort = flag.Int("fport", 2055, "NetFlowV9/IPFIX listening port")
+
+	LAddr = flag.String("laddr", ":", "NetFlowV5 listening address")
+	LPort = flag.Int("lport", 2055, "NetFlowV5 listening port")
 
 	SAddr = flag.String("saddr", ":", "sFlow listening address")
 	SPort = flag.Int("sport", 6343, "sFlow listening port")
 
-	FWorkers = flag.Int("fworkers", 1, "Number of NetFlow workers")
+	FWorkers = flag.Int("fworkers", 1, "Number of NetFlowV9/IPFIX workers")
+	LWorkers = flag.Int("lworkers", 1, "Number of NetFlowV5 workers")
 	SWorkers = flag.Int("sworkers", 1, "Number of sFlow workers")
 	LogLevel = flag.String("loglevel", "info", "Log level")
 	LogFmt   = flag.String("logfmt", "normal", "Log formatter")
@@ -611,6 +617,76 @@ func (s *state) decodeSflow(msg interface{}) error {
 	return nil
 }
 
+func (s *state) decodeNetFlowLegacy(msg interface{}) error {
+	pkt := msg.(BaseMessage)
+	buf := bytes.NewBuffer(pkt.Payload)
+	key := pkt.Src.String()
+
+	routerAddr := pkt.Src
+	if routerAddr.To4() != nil {
+		routerAddr = routerAddr.To4()
+	}
+
+	timeTrackStart := time.Now()
+	msgDec, err := netflowlegacy.DecodeMessage(buf)
+
+	if err != nil {
+		NetFlowErrors.With(
+			prometheus.Labels{
+				"router": key,
+				"error":  "error_decoding",
+			}).
+			Inc()
+		return err
+	}
+
+	switch msgDecConv := msgDec.(type) {
+	case netflowlegacy.PacketNetFlowV5:
+		NetFlowSetStatsSum.With(
+			prometheus.Labels{
+				"router":  key,
+				"version": "5",
+				"type":    "Sample",
+			}).
+			Inc()
+
+		NetFlowSetRecordsStatsSum.With(
+			prometheus.Labels{
+				"router":  key,
+				"version": "5",
+				"type":    "Sample",
+			}).
+			Add(float64(len(msgDecConv.Records)))
+
+	}
+
+	var flowMessageSet []*flowmessage.FlowMessage
+	flowMessageSet, err = producer.ProcessMessageNetFlowLegacy(msgDec)
+
+	timeTrackStop := time.Now()
+	DecoderTime.With(
+		prometheus.Labels{
+			"name": "NetFlowLegacy",
+		}).
+		Observe(float64((timeTrackStop.Sub(timeTrackStart)).Nanoseconds()) / 1000)
+
+	for _, fmsg := range flowMessageSet {
+		fmsg.TimeRecvd = uint64(time.Now().UTC().Unix())
+		fmsg.RouterAddr = routerAddr
+		timeDiff := fmsg.TimeRecvd - fmsg.TimeFlow
+		NetFlowTimeStatsSum.With(
+			prometheus.Labels{
+				"router":  key,
+				"version": "5",
+			}).
+			Observe(float64(timeDiff))
+	}
+
+	s.produceFlow(flowMessageSet)
+
+	return nil
+}
+
 func (s *state) accountCallback(name string, id int, start, end time.Time) {
 	DecoderProcessTime.With(
 		prometheus.Labels{
@@ -639,6 +715,7 @@ type state struct {
 
 	fworkers int
 	sworkers int
+	lworkers int
 }
 
 func (s *state) sflowRoutine() {
@@ -716,6 +793,81 @@ func (s *state) sflowRoutine() {
 	udpconn.Close()
 }
 
+func (s *state) netflowLegacyRoutine() {
+	decoderParams := decoder.DecoderParams{
+		DecoderFunc:   s.decodeNetFlowLegacy,
+		DoneCallback:  s.accountCallback,
+		ErrorCallback: nil,
+	}
+
+	processor := decoder.CreateProcessor(s.lworkers, decoderParams, "NetFlowLegacy")
+	log.WithFields(log.Fields{
+		"Name": "NetFlowLegacy"}).Debug("Starting workers")
+	processor.Start()
+
+	addr := net.UDPAddr{
+		IP:   net.ParseIP(*LAddr),
+		Port: *LPort,
+	}
+	udpconn, err := net.ListenUDP("udp", &addr)
+	if err != nil {
+		log.Fatalf("Fatal error: could not listen to UDP (%v)", err)
+		udpconn.Close()
+	}
+
+	payload := make([]byte, 9000)
+
+	localIP := addr.IP.String()
+	if addr.IP == nil {
+		localIP = ""
+	}
+	log.WithFields(log.Fields{
+		"Type": "NetFlowLegacy"}).
+		Infof("Listening on UDP %v:%v", localIP, strconv.Itoa(addr.Port))
+	for {
+		size, pktAddr, _ := udpconn.ReadFromUDP(payload)
+		payloadCut := make([]byte, size)
+		copy(payloadCut, payload[0:size])
+
+		baseMessage := BaseMessage{
+			Src:     pktAddr.IP,
+			Port:    pktAddr.Port,
+			Payload: payloadCut,
+		}
+		processor.ProcessMessage(baseMessage)
+
+		MetricTrafficBytes.With(
+			prometheus.Labels{
+				"remote_ip":   pktAddr.IP.String(),
+				"remote_port": strconv.Itoa(pktAddr.Port),
+				"local_ip":    localIP,
+				"local_port":  strconv.Itoa(addr.Port),
+				"type":        "NetFlowLegacy",
+			}).
+			Add(float64(size))
+		MetricTrafficPackets.With(
+			prometheus.Labels{
+				"remote_ip":   pktAddr.IP.String(),
+				"remote_port": strconv.Itoa(pktAddr.Port),
+				"local_ip":    localIP,
+				"local_port":  strconv.Itoa(addr.Port),
+				"type":        "NetFlowLegacy",
+			}).
+			Inc()
+		MetricPacketSizeSum.With(
+			prometheus.Labels{
+				"remote_ip":   pktAddr.IP.String(),
+				"remote_port": strconv.Itoa(pktAddr.Port),
+				"local_ip":    localIP,
+				"local_port":  strconv.Itoa(addr.Port),
+				"type":        "NetFlowLegacy",
+			}).
+			Observe(float64(size))
+	}
+
+	udpconn.Close()
+}
+
 func GetServiceAddresses(srv string) (addrs []string, err error) {
 	_, srvs, err := net.LookupSRV("", "", srv)
 	if err != nil {
@@ -749,12 +901,14 @@ func main() {
 	wg := &sync.WaitGroup{}
 	log.WithFields(log.Fields{
 		"NetFlow": *FEnable,
-		"sFlow":   *SEnable}).
+		"sFlow":   *SEnable,
+		"NetFlowV5":   *LEnable,}).
 		Info("Starting GoFlow")
 
 	s := &state{
 		fworkers: *FWorkers,
 		sworkers: *SWorkers,
+		lworkers: *LWorkers,
 	}
 
 	if *LogLevel == "debug" {
@@ -784,6 +938,13 @@ func main() {
 		(*wg).Add(1)
 		go func() {
 			s.sflowRoutine()
+			(*wg).Done()
+		}()
+	}
+	if *LEnable {
+		(*wg).Add(1)
+		go func() {
+			s.netflowLegacyRoutine()
 			(*wg).Done()
 		}()
 	}

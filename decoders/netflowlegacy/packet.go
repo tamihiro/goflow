@@ -8,7 +8,7 @@ import (
 )
 
 type PacketNetFlowV5 struct {
-    Version        uint16
+    Version uint16
     Count uint16
     SysUptime uint32
     UnixSecs uint32
